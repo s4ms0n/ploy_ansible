@@ -23,7 +23,8 @@ def ctrl(ployconf):
     import ploy_ansible
     import ploy.tests.dummy_plugin
     ployconf.fill([
-        '[dummy-instance:foo]'])
+        '[dummy-instance:foo]',
+        'host = foo'])
     ctrl = Controller(configpath=ployconf.directory)
     ctrl.plugins = {
         'dummy': ploy.tests.dummy_plugin.plugin,

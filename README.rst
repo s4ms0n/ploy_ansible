@@ -154,14 +154,11 @@ API usage
 
 On the Python side, each ploy instance gains the following methods:
 
-``apply_playbook(self, playbook, *args, **kwargs)``
-  Applies the ``playbook`` to the instance.
-
 ``has_playbook``
   Return ``True`` if the instance has either of the ``roles`` or a playbook option set.
 
-``get_playbook(*args, **kwargs)``
-  Returns an instance of the Ansible internal ``PlayBook`` class.
+``get_plays(*args, **kwargs)``
+  Returns a list of instances of the Ansible internal ``Play`` class.
   This is either from a file (from ``playbook`` option or the playbook kwarg), or dynamically generated from the ``roles`` option.
 
 ``configure(*args, **kwargs)``

@@ -7,21 +7,13 @@ README = open(os.path.join(here, 'README.rst')).read()
 HISTORY = open(os.path.join(here, 'HISTORY.rst')).read()
 
 
-version = "1.3.3.dev0"
+version = "2.0.0.dev0"
 
 
 install_requires = [
-    'setuptools',
+    'ansible>=2.4',
     'ploy >= 1.0.0, < 2dev',
     'execnet']
-
-
-# workaround for installing via buildout, as ansible<1.8.0
-# violates its sandbox limitations
-try:
-    import ansible  # noqa
-except ImportError:
-    install_requires.append('ansible>=1.8.0,<2.dev0')
 
 
 setup(
@@ -36,7 +28,6 @@ setup(
     classifiers=[
         'Environment :: Console',
         'Intended Audience :: System Administrators',
-        'Programming Language :: Python :: 2.6',
         'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 2 :: Only',
         'Topic :: System :: Installation/Setup',

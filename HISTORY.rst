@@ -1,9 +1,11 @@
 Changelog
 =========
 
-1.3.3 - Unreleased
+2.0.0 - Unreleased
 ------------------
 
+* Support ansible >= 2.4.0 and drop support for previous versions.
+  [fschulze]
 
 
 1.3.2 - 2016-06-02

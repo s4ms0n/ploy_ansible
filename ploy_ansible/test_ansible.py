@@ -44,7 +44,7 @@ def test_configure_with_empty_yml(ctrl, tempdir):
             ctrl(['./bin/ploy', 'configure', 'foo'])
     assert len(LogMock.error.call_args_list) == 1
     call_args = LogMock.error.call_args_list[0][0]
-    assert 'parse error: playbooks must be formatted as a YAML list' in call_args[0]
+    assert 'playbooks must be a list of plays' in call_args[0]
 
 
 def test_configure_asks_when_no_host_in_yml(ctrl, tempdir):
@@ -66,28 +66,34 @@ def test_configure(ctrl, monkeypatch, tempdir):
         '---',
         '- hosts: default-foo'])
     runmock = MagicMock()
-    monkeypatch.setattr("ansible.playbook.PlayBook.run", runmock)
+    monkeypatch.setattr("ansible.executor.task_queue_manager.TaskQueueManager.run", runmock)
     ctrl(['./bin/ploy', 'configure', 'foo'])
     assert runmock.called
 
 
 def test_configure_playbook_option(ctrl, ployconf, tempdir):
-    import ansible.playbook
+    import ansible.executor.task_queue_manager
+    roles = tempdir.mkdir('roles')
+    roles.mkdir('bar')
     yml = tempdir['default-bar.yml']
     yml.fill([
         '---',
-        '- hosts: default-foo'])
+        '- hosts: default-foo',
+        '  roles:',
+        '    - bar'])
     ployconf.fill([
         '[dummy-instance:foo]',
+        'host = foo',
         'playbook = %s' % yml.path])
-    with patch.object(ansible.playbook.PlayBook, "run", autospec=True) as runmock:
+    with patch.object(ansible.executor.task_queue_manager.TaskQueueManager, "run", autospec=True) as runmock:
         ctrl(['./bin/ploy', 'configure', 'foo'])
     assert runmock.called
-    assert runmock.call_args[0][0].filename == yml.path
+    play = runmock.call_args[1]['play']
+    assert play.get_roles()[0].get_name() == 'bar'
 
 
 def test_configure_playbook_option_shadowing(ctrl, ployconf, caplog, tempdir):
-    import ansible.playbook
+    import ansible.executor.task_queue_manager
     yml_foo = tempdir['default-foo.yml']
     yml_foo.fill('')
     yml_bar = tempdir['default-bar.yml']
@@ -96,27 +102,33 @@ def test_configure_playbook_option_shadowing(ctrl, ployconf, caplog, tempdir):
         '- hosts: default-foo'])
     ployconf.fill([
         '[dummy-instance:foo]',
+        'host = foo',
         'playbook = %s' % yml_bar.path])
-    with patch.object(ansible.playbook.PlayBook, "run", autospec=True) as runmock:
+    with patch.object(ansible.executor.task_queue_manager.TaskQueueManager, "run", autospec=True) as runmock:
         ctrl(['./bin/ploy', 'configure', 'foo'])
     assert runmock.called
-    assert runmock.call_args[0][0].filename == yml_bar.path
     assert [x.message for x in caplog.records] == [
         "Instance 'dummy-instance:foo' has the 'playbook' option set, but there is also a playbook at the default location '%s', which differs from '%s'." % (yml_foo.path, yml_bar.path),
         "Using playbook at '%s'." % yml_bar.path]
 
 
 def test_configure_roles_option(ctrl, ployconf, tempdir):
-    import ansible.playbook
+    import ansible.executor.task_queue_manager
     ployconf.fill([
         '[dummy-instance:foo]',
+        'host = foo',
         'roles = ham egg'])
-    with patch.object(ansible.playbook.PlayBook, "run", autospec=True) as runmock:
+    roles = tempdir.mkdir('roles')
+    roles.mkdir('ham')
+    roles.mkdir('egg')
+    with patch.object(ansible.executor.task_queue_manager.TaskQueueManager, "run", autospec=True) as runmock:
         ctrl(['./bin/ploy', 'configure', 'foo'])
     assert runmock.called
-    assert runmock.call_args[0][0].filename == "<dynamically generated from ['ham', 'egg']>"
-    assert runmock.call_args[0][0].playbook == [{'hosts': ['default-foo'], 'user': 'root', 'roles': ['ham', 'egg']}]
-    assert runmock.call_args[0][0].play_basedirs == [tempdir.directory]
+    play = runmock.call_args[1]['play']
+    assert play.hosts == ['default-foo']
+    assert play.remote_user == 'root'
+    assert play.roles[0].get_name() == 'ham'
+    assert play.roles[1].get_name() == 'egg'
 
 
 def test_configure_roles_default_playbook_conflict(ctrl, ployconf, caplog, tempdir):
@@ -124,6 +136,7 @@ def test_configure_roles_default_playbook_conflict(ctrl, ployconf, caplog, tempd
     yml.fill('')
     ployconf.fill([
         '[dummy-instance:foo]',
+        'host = foo',
         'roles = ham egg'])
     with pytest.raises(SystemExit):
         ctrl(['./bin/ploy', 'configure', 'foo'])
@@ -139,6 +152,7 @@ def test_configure_roles_playbook_option_conflict(ctrl, ployconf, caplog, tempdi
         '- hosts: default-foo'])
     ployconf.fill([
         '[dummy-instance:foo]',
+        'host = foo',
         'playbook = %s' % yml.path,
         'roles = ham egg'])
     with pytest.raises(SystemExit):
@@ -153,10 +167,11 @@ def test_configure_with_extra_vars(ctrl, monkeypatch, tempdir):
     tempdir['default-foo.yml'].fill([
         '---',
         '- hosts: default-foo'])
-    with patch.object(ansible.playbook.PlayBook, "run", autospec=True) as runmock:
+    with patch.object(ansible.executor.task_queue_manager.TaskQueueManager, "run", autospec=True) as runmock:
         ctrl(['./bin/ploy', 'configure', 'foo', '-e', 'foo=bar', '-e', 'bar=foo'])
     assert runmock.called
-    assert runmock.call_args[0][0].extra_vars == dict(foo='bar', bar='foo')
+    tqm = runmock.call_args[0][0]
+    assert tqm.get_variable_manager().extra_vars == dict(foo='bar', bar='foo')
 
 
 def test_playbook_without_args(ctrl):
@@ -165,7 +180,7 @@ def test_playbook_without_args(ctrl):
         with pytest.raises(SystemExit):
             ctrl(['./bin/ploy', 'playbook'])
     output = "".join(x[0][0] for x in StdErrMock.write.call_args_list)
-    assert 'Usage: ploy playbook playbook.yml' in output
+    assert 'You must specify a playbook file to run' in output
 
 
 def test_playbook_with_nonexisting_playbook(ctrl):
@@ -176,63 +191,60 @@ def test_playbook_with_nonexisting_playbook(ctrl):
     assert "the playbook: bar.yml could not be found" in output
 
 
-def test_playbook_with_empty_yml(ctrl, tempdir):
+def test_playbook_with_empty_yml(ctrl, tempdir, capsys):
     yml = tempdir['foo.yml']
     yml.fill('')
-    with patch('sys.stderr') as StdErrMock:
-        with pytest.raises(SystemExit):
-            ctrl(['./bin/ploy', 'playbook', yml.path])
-    output = "".join(x[0][0] for x in StdErrMock.write.call_args_list)
-    assert 'parse error: playbooks must be formatted as a YAML list' in output
+    with pytest.raises(SystemExit):
+        ctrl(['./bin/ploy', 'playbook', yml.path])
+    (out, err) = capsys.readouterr()
+    assert 'playbooks must be a list of plays' in err
 
 
-def test_playbook_asks_when_no_host_in_yml(ctrl, tempdir):
+def test_playbook_asks_when_no_host_in_yml(ctrl, tempdir, capsys):
     yml = tempdir['foo.yml']
     yml.fill([
         '---',
         '- {}'])
-    with patch('sys.stderr') as StdErrMock:
-        with pytest.raises(SystemExit):
-            ctrl(['./bin/ploy', 'playbook', yml.path])
-    output = "".join(x[0][0] for x in StdErrMock.write.call_args_list)
-    assert 'hosts declaration is required' in output
+    with pytest.raises(SystemExit):
+        ctrl(['./bin/ploy', 'playbook', yml.path])
+    (out, err) = capsys.readouterr()
+    assert "the field 'hosts' is required but was not set" in err
 
 
 def test_playbook(ctrl, monkeypatch, tempdir):
     yml = tempdir['foo.yml']
     yml.fill([
         '---',
-        '- hosts: foo'])
+        '- hosts: default-foo'])
     runmock = MagicMock()
-    monkeypatch.setattr("ansible.playbook.PlayBook.run", runmock)
+    monkeypatch.setattr("ansible.executor.playbook_executor.PlaybookExecutor.run", runmock)
+    runmock.return_value = 0
     ctrl(['./bin/ploy', 'playbook', yml.path])
     assert runmock.called
 
 
-def test_ansible_without_args(ctrl):
-    with patch('sys.stdout') as StdOutMock:
-        StdOutMock.encoding = 'utf-8'
-        with pytest.raises(SystemExit):
-            ctrl(['./bin/ploy', 'ansible'])
-    output = "".join(x[0][0] for x in StdOutMock.write.call_args_list)
-    assert 'Usage: ploy ansible' in output
+def test_ansible_without_args(ctrl, capsys):
+    with pytest.raises(SystemExit):
+        ctrl(['./bin/ploy', 'ansible'])
+    (out, err) = capsys.readouterr()
+    assert 'Missing target hosts' in err
 
 
-def test_ansible_with_nonexisting_instance(ctrl):
-    with patch('sys.stderr') as StdErrMock:
-        with pytest.raises(SystemExit):
-            ctrl(['./bin/ploy', 'ansible', 'bar'])
-    output = "".join(x[0][0] for x in StdErrMock.write.call_args_list)
-    assert "No hosts matched" in output
+def test_ansible_with_nonexisting_instance(ctrl, capsys):
+    with pytest.raises(SystemExit):
+        ctrl(['./bin/ploy', 'ansible', 'bar'])
+    (out, err) = capsys.readouterr()
+    assert "No hosts matched" in err
 
 
 def test_ansible(ctrl, monkeypatch):
     runmock = MagicMock()
-    monkeypatch.setattr("ansible.runner.Runner.run", runmock)
+    monkeypatch.setattr("ansible.executor.task_queue_manager.TaskQueueManager.run", runmock)
     runmock.return_value = dict(
         contacted=dict(),
         dark=[])
-    ctrl(['./bin/ploy', 'ansible', 'default-foo', '-a', 'ls'])
+    with pytest.raises(SystemExit):
+        ctrl(['./bin/ploy', 'ansible', 'default-foo', '-a', 'ls'])
     assert runmock.called
 
 

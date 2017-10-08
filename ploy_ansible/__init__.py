@@ -9,13 +9,13 @@ from binascii import b2a_base64
 from lazy import lazy
 from ploy.common import yesno
 from operator import attrgetter
-from os.path import pathsep
 
 
 log = logging.getLogger('ploy_ansible')
 
 
 ansible_paths = dict(
+    connection=[os.path.join(os.path.abspath(os.path.dirname(__file__)), 'connection_plugins')],
     lookup=[os.path.join(os.path.abspath(os.path.dirname(__file__)), 'lookup_plugins')])
 
 
@@ -24,19 +24,29 @@ def get_ansible_version():
     return tuple(int(x) for x in __version__.split('.'))
 
 
-def inject_ansible_paths():
+def inject_ansible_paths(ctrl=None):
     # collect and inject ansible paths (roles and library) from entrypoints
     try:
         import ansible.constants as C
-        import ansible
     except ImportError:
         log.error("Can't import ansible, check whether it's installed correctly.")
         sys.exit(1)
-    if get_ansible_version() >= (1, 10):
+    if ctrl is not None:
+        from ansible.playbook.play_context import PlayContext
+        from ploy_ansible.inventory import InventoryManager
+        PlayContext._ploy_ctrl = ctrl
+        InventoryManager._ploy_ctrl = ctrl
+    if getattr(inject_ansible_paths, 'done', False):
+        return
+    from ansible.utils.display import Display
+    global display
+    display = sys.modules['__main__'].display = Display()
+    if get_ansible_version() >= (2, 5):
+        from ansible import __version__
         log.warn(
             "You are using an untested version %s of ansible. "
-            "The latest tested version is 1.9.X. "
-            "Any errors may be caused by that newer version." % ansible.__version__)
+            "The latest tested version is 2.4.X. "
+            "Any errors may be caused by that newer version." % __version__)
     extra_roles = []
     extra_library = []
     plugin_path_names = set(x for x in dir(C) if x.endswith('_PLUGIN_PATH'))
@@ -49,18 +59,15 @@ def inject_ansible_paths():
             plugin_path_name = 'DEFAULT_%s_PLUGIN_PATH' % key.upper()
             if plugin_path_name in plugin_path_names:
                 extra_plugins.setdefault(plugin_path_name, []).extend(pathinfo[key])
-    roles = list(extra_roles)
-    if C.DEFAULT_ROLES_PATH is not None:
-        roles.append(C.DEFAULT_ROLES_PATH)
-    if roles:
-        C.DEFAULT_ROLES_PATH = pathsep.join(roles)
-    library = list(extra_library)
-    if C.DEFAULT_MODULE_PATH is not None:
-        library.append(C.DEFAULT_MODULE_PATH)
-    if library:
-        C.DEFAULT_MODULE_PATH = pathsep.join(library)
+    C.DEFAULT_ROLES_PATH[0:0] = extra_roles
+    C.DEFAULT_MODULE_PATH[0:0] = extra_library
+    C.DEFAULT_TRANSPORT = 'execnet_connection'
     for attr in extra_plugins:
-        setattr(C, attr, pathsep.join([pathsep.join(extra_plugins[attr]), getattr(C, attr)]))
+        getattr(C, attr)[0:0] = extra_plugins[attr]
+    import ansible.inventory.manager
+    from ploy_ansible.inventory import InventoryManager
+    ansible.inventory.manager.InventoryManager = InventoryManager
+    inject_ansible_paths.done = True
 
 
 def get_playbooks_directory(main_config):
@@ -129,6 +136,45 @@ def get_vault_password_source(main_config, option='vault-password-source'):
     return KeyringSource(src)
 
 
+def run_cli(ctrl, name, sub, argv, myclass=None):
+    inject_ansible_paths(ctrl)
+    import ansible.constants as C
+    from ansible import errors
+    from ansible.module_utils._text import to_text
+    import shutil
+    try:
+        from ansible.parsing.vault import VaultLib
+    except ImportError:
+        VaultLib = None
+    if myclass is None:
+        myclass = "%sCLI" % sub.capitalize()
+    mycli = getattr(
+        __import__("ansible.cli.%s" % sub, fromlist=[myclass]),
+        myclass)
+    try:
+        cli = mycli(["%s %s" % (ctrl.progname, name)] + argv)
+        cli.parse()
+        exit_code = cli.run()
+    except errors.AnsibleOptionsError as e:
+        cli.parser.print_help()
+        display.error(to_text(e), wrap_text=False)
+        exit_code = 5
+    except errors.AnsibleParserError as e:
+        display.error(to_text(e), wrap_text=False)
+        exit_code = 4
+    except errors.AnsibleError as e:
+        display.error(to_text(e), wrap_text=False)
+        exit_code = 1
+    except KeyboardInterrupt:
+        display.error("User interrupted execution")
+        exit_code = 99
+    finally:
+        # Remove ansible tempdir
+        shutil.rmtree(C.DEFAULT_LOCAL_TMP, True)
+    if exit_code != 0:
+        sys.exit(exit_code)
+
+
 class AnsibleCmd(object):
     """Run Ansible"""
 
@@ -136,187 +182,7 @@ class AnsibleCmd(object):
         self.ctrl = ctrl
 
     def __call__(self, argv, help):
-        inject_ansible_paths()
-        import ansible.constants as C
-        from ansible.runner import Runner
-        from ansible import errors
-        from ansible import callbacks
-        from ploy_ansible.inventory import Inventory
-        from ansible import utils
-        try:
-            from ansible.utils.vault import VaultLib
-        except ImportError:
-            VaultLib = None
-        parser = utils.base_parser(
-            constants=C,
-            runas_opts=True,
-            subset_opts=True,
-            output_opts=True,
-            check_opts=True,
-            diff_opts=False,
-            usage='%s ansible <host-pattern> [options]' % self.ctrl.progname
-        )
-        parser.remove_option('-i')
-        parser.remove_option('-k')
-        parser.add_option(
-            '-a', '--args', dest='module_args',
-            help="module arguments", default=C.DEFAULT_MODULE_ARGS)
-        parser.add_option(
-            '-m', '--module-name', dest='module_name',
-            help="module name to execute (default=%s)" % C.DEFAULT_MODULE_NAME,
-            default=C.DEFAULT_MODULE_NAME)
-        options, args = parser.parse_args(argv)
-        if len(args) == 0 or len(args) > 1:
-            parser.print_help()
-            sys.exit(1)
-
-        if hasattr(options, 'become_ask_pass'):
-            # privlege escalation command line arguments need to be mutually exclusive
-            utils.check_mutually_exclusive_privilege(options, parser)
-        else:
-            # su and sudo command line arguments need to be mutually exclusive
-            if (hasattr(options, 'su')
-                    and (options.su or options.su_user or options.ask_su_pass)
-                    and (options.sudo or options.sudo_user or options.ask_sudo_pass)):
-                parser.error("Sudo arguments ('--sudo', '--sudo-user', and '--ask-sudo-pass') "
-                             "and su arguments ('-su', '--su-user', and '--ask-su-pass') are "
-                             "mutually exclusive")
-
-        if hasattr(options, 'ask_vault_pass') and (options.ask_vault_pass and options.vault_password_file):
-                parser.error("--ask-vault-pass and --vault-password-file are mutually exclusive")
-
-        cbs = callbacks.CliRunnerCallbacks()
-        cbs.options = options
-        pattern = args[0]
-        patch_connect(self.ctrl)
-        vault_pass = None
-        kw = {}
-        if hasattr(options, 'become_ask_pass'):
-            becomepass = None
-            become_method = None
-            utils.normalize_become_options(options)
-            become_method = utils.choose_pass_prompt(options)
-            kw['become_ask_pass'] = options.become_ask_pass
-            kw['become_method'] = become_method
-        else:
-            sudopass = None
-            su_pass = None
-            options.ask_sudo_pass = options.ask_sudo_pass or C.DEFAULT_ASK_SUDO_PASS
-            kw['ask_sudo_pass'] = options.ask_sudo_pass
-            if hasattr(options, 'ask_su_pass'):
-                options.ask_su_pass = options.ask_su_pass or C.DEFAULT_ASK_SU_PASS
-                kw['ask_su_pass'] = options.ask_sudo_pass
-        if hasattr(options, 'ask_vault_pass'):
-            options.ask_vault_pass = options.ask_vault_pass or C.DEFAULT_ASK_VAULT_PASS
-            kw['ask_vault_pass'] = options.ask_vault_pass
-        passwds = utils.ask_passwords(**kw)
-        if hasattr(options, 'become_ask_pass'):
-            (sshpass, becomepass, vault_pass) = passwds
-        else:
-            if len(passwds) == 2:
-                (sshpass, sudopass) = passwds
-            elif len(passwds) == 3:
-                (sshpass, sudopass, su_pass) = passwds
-            else:
-                (sshpass, sudopass, su_pass, vault_pass) = passwds
-        if VaultLib is not None and vault_pass is None:
-            vault_pass = get_vault_password_source(self.ctrl.config).get()
-        if getattr(options, 'vault_password_file', None):
-            this_path = os.path.expanduser(options.vault_password_file)
-            try:
-                f = open(this_path, "rb")
-                tmp_vault_pass = f.read().strip()
-                f.close()
-            except (OSError, IOError), e:
-                raise errors.AnsibleError("Could not read %s: %s" % (this_path, e))
-
-            if not options.ask_vault_pass:
-                vault_pass = tmp_vault_pass
-
-        inventory_manager = Inventory(self.ctrl, vault_password=vault_pass)
-        if options.subset:
-            inventory_manager.subset(options.subset)
-        hosts = inventory_manager.list_hosts(pattern)
-        if len(hosts) == 0:
-            callbacks.display("No hosts matched", stderr=True)
-            sys.exit(1)
-        if options.listhosts:
-            for host in hosts:
-                callbacks.display('    %s' % host)
-            sys.exit(0)
-        if options.module_name in ['command', 'shell'] and not options.module_args:
-            callbacks.display("No argument passed to %s module" % options.module_name, color='red', stderr=True)
-            sys.exit(1)
-
-        if not hasattr(options, 'become_ask_pass'):
-            if options.sudo_user or options.ask_sudo_pass:
-                options.sudo = True
-            options.sudo_user = options.sudo_user or C.DEFAULT_SUDO_USER
-            if hasattr(options, 'su'):
-                if options.su_user or options.ask_su_pass:
-                    options.su = True
-                options.su_user = options.su_user or C.DEFAULT_SU_USER
-        if options.tree:
-            utils.prepare_writeable_dir(options.tree)
-        kw = {}
-        if hasattr(options, 'become_ask_pass'):
-            kw['become'] = options.become
-            kw['become_method'] = options.become_method
-            kw['become_pass'] = becomepass
-            kw['become_user'] = options.become_user
-        else:
-            if hasattr(options, 'su'):
-                kw['su'] = options.su
-                kw['su_user'] = options.su_user
-            if hasattr(options, 'su_pass'):
-                kw['su_pass'] = options.su_pass
-            kw['sudo'] = options.sudo
-            kw['sudo_user'] = options.sudo_user
-            kw['sudo_pass'] = sudopass
-        if vault_pass:
-            kw['vault_pass'] = vault_pass
-        runner = Runner(
-            module_name=options.module_name,
-            module_path=options.module_path,
-            module_args=options.module_args,
-            remote_user=options.remote_user,
-            inventory=inventory_manager,
-            timeout=options.timeout,
-            private_key_file=options.private_key_file,
-            forks=options.forks,
-            pattern=pattern,
-            callbacks=cbs,
-            transport='ssh',
-            subset=options.subset,
-            check=options.check,
-            diff=options.check,
-            **kw)
-        results = runner.run()
-        for result in results['contacted'].values():
-            if 'failed' in result or result.get('rc', 0) != 0:
-                sys.exit(2)
-        if results['dark']:
-            sys.exit(3)
-
-
-def parse_extra_vars(extras, vault_pass=None):
-    inject_ansible_paths()
-    from ansible import utils
-    extra_vars = {}
-    for extra_vars_opt in extras:
-        if extra_vars_opt.startswith("@"):
-            # Argument is a YAML file (JSON is a subset of YAML)
-            kw = {}
-            if vault_pass:
-                kw['vault_password'] = vault_pass
-            extra_vars = utils.combine_vars(extra_vars, utils.parse_yaml_from_file(extra_vars_opt[1:]), **kw)
-        elif extra_vars_opt and extra_vars_opt[0] in '[{':
-            # Arguments as YAML
-            extra_vars = utils.combine_vars(extra_vars, utils.parse_yaml(extra_vars_opt))
-        else:
-            # Arguments as Key-value
-            extra_vars = utils.combine_vars(extra_vars, utils.parse_kv(extra_vars_opt))
-    return extra_vars
+        return run_cli(self.ctrl, 'ansible', 'adhoc', argv, myclass='AdHocCLI')
 
 
 class AnsiblePlaybookCmd(object):
@@ -326,314 +192,7 @@ class AnsiblePlaybookCmd(object):
         self.ctrl = ctrl
 
     def __call__(self, argv, help):
-        inject_ansible_paths()
-        import ansible.playbook
-        import ansible.constants as C
-        from ansible import errors
-        from ansible import callbacks
-        from ploy_ansible.inventory import Inventory
-        from ansible import utils
-        from ansible.color import ANSIBLE_COLOR, stringc
-        try:
-            from ansible.utils.vault import VaultLib
-        except ImportError:
-            VaultLib = None
-
-        ansible_version = get_ansible_version()
-        parser = utils.base_parser(
-            constants=C,
-            connect_opts=True,
-            runas_opts=True,
-            subset_opts=True,
-            check_opts=True,
-            diff_opts=True,
-            usage='%s playbook playbook.yml' % self.ctrl.progname
-        )
-        parser.remove_option('-i')
-        parser.remove_option('-k')
-        if not parser.has_option('--extra-vars'):
-            parser.add_option(
-                '-e', '--extra-vars', dest="extra_vars", action="append",
-                help="set additional variables as key=value or YAML/JSON", default=[])
-        parser.add_option(
-            '-t', '--tags', dest='tags', default='all',
-            help="only run plays and tasks tagged with these values")
-        parser.add_option(
-            '--skip-tags', dest='skip_tags',
-            help="only run plays and tasks whose tags do not match these values")
-        parser.add_option(
-            '--syntax-check', dest='syntax', action='store_true',
-            help="perform a syntax check on the playbook, but do not execute it")
-        parser.add_option(
-            '--list-tasks', dest='listtasks', action='store_true',
-            help="list all tasks that would be executed")
-        parser.add_option(
-            '--step', dest='step', action='store_true',
-            help="one-step-at-a-time: confirm each task before running")
-        parser.add_option(
-            '--start-at-task', dest='start_at',
-            help="start the playbook at the task matching this name")
-        if ansible_version >= (1, 6):
-            parser.add_option(
-                '--force-handlers', dest='force_handlers', action='store_true',
-                help="run handlers even if a task fails")
-        options, args = parser.parse_args(argv)
-        cbs = callbacks.CliRunnerCallbacks()
-        cbs.options = options
-        if len(args) == 0:
-            parser.print_help(file=sys.stderr)
-            sys.exit(1)
-
-        if hasattr(options, 'become_ask_pass'):
-            # privlege escalation command line arguments need to be mutually exclusive
-            utils.check_mutually_exclusive_privilege(options, parser)
-        else:
-            # su and sudo command line arguments need to be mutually exclusive
-            if (hasattr(options, 'su')
-                    and (options.su or options.su_user or options.ask_su_pass)
-                    and (options.sudo or options.sudo_user or options.ask_sudo_pass)):
-                parser.error("Sudo arguments ('--sudo', '--sudo-user', and '--ask-sudo-pass') "
-                             "and su arguments ('-su', '--su-user', and '--ask-su-pass') are "
-                             "mutually exclusive")
-
-        if hasattr(options, 'ask_vault_pass') and (options.ask_vault_pass and options.vault_password_file):
-                parser.error("--ask-vault-pass and --vault-password-file are mutually exclusive")
-
-        def colorize(lead, num, color):
-            """ Print 'lead' = 'num' in 'color' """
-            if num != 0 and ANSIBLE_COLOR and color is not None:
-                return "%s%s%-15s" % (stringc(lead, color), stringc("=", color), stringc(str(num), color))
-            else:
-                return "%s=%-4s" % (lead, str(num))
-
-        def hostcolor(host, stats, color=True):
-            if ANSIBLE_COLOR and color:
-                if stats['failures'] != 0 or stats['unreachable'] != 0:
-                    return "%-37s" % stringc(host, 'red')
-                elif stats['changed'] != 0:
-                    return "%-37s" % stringc(host, 'yellow')
-                else:
-                    return "%-37s" % stringc(host, 'green')
-            return "%-26s" % host
-
-        try:
-            patch_connect(self.ctrl)
-            if hasattr(options, 'become_ask_pass'):
-                becomepass = None
-            else:
-                sudopass = None
-                su_pass = None
-            vault_pass = None
-            if not options.listhosts and not options.syntax and not options.listtasks:
-                kw = {}
-                if hasattr(options, 'become_ask_pass'):
-                    utils.normalize_become_options(options)
-                    become_method = utils.choose_pass_prompt(options)
-                    kw['become_ask_pass'] = options.become_ask_pass
-                    kw['become_method'] = become_method
-                else:
-                    options.ask_sudo_pass = options.ask_sudo_pass or C.DEFAULT_ASK_SUDO_PASS
-                    kw['ask_sudo_pass'] = options.ask_sudo_pass
-                    if hasattr(options, 'ask_su_pass'):
-                        options.ask_su_pass = options.ask_su_pass or C.DEFAULT_ASK_SU_PASS
-                        kw['ask_su_pass'] = options.ask_sudo_pass
-                if hasattr(options, 'ask_vault_pass'):
-                    options.ask_vault_pass = options.ask_vault_pass or C.DEFAULT_ASK_VAULT_PASS
-                    kw['ask_vault_pass'] = options.ask_vault_pass
-                passwds = utils.ask_passwords(**kw)
-                if hasattr(options, 'become_ask_pass'):
-                    (sshpass, becomepass, vault_pass) = passwds
-                else:
-                    if len(passwds) == 2:
-                        (sshpass, sudopass) = passwds
-                    elif len(passwds) == 3:
-                        (sshpass, sudopass, su_pass) = passwds
-                    else:
-                        (sshpass, sudopass, su_pass, vault_pass) = passwds
-                if VaultLib is not None and vault_pass is None:
-                    vault_pass = get_vault_password_source(self.ctrl.config).get()
-                if options.sudo_user or options.ask_sudo_pass:
-                    options.sudo = True
-                options.sudo_user = options.sudo_user or C.DEFAULT_SUDO_USER
-                if hasattr(options, 'su'):
-                    if options.su_user or options.ask_su_pass:
-                        options.su = True
-                    options.su_user = options.su_user or C.DEFAULT_SU_USER
-                if getattr(options, 'vault_password_file', None):
-                    this_path = os.path.expanduser(options.vault_password_file)
-                    try:
-                        f = open(this_path, "rb")
-                        tmp_vault_pass = f.read().strip()
-                        f.close()
-                    except (OSError, IOError), e:
-                        raise errors.AnsibleError("Could not read %s: %s" % (this_path, e))
-
-                    if not options.ask_vault_pass:
-                        vault_pass = tmp_vault_pass
-            inventory = Inventory(self.ctrl, vault_password=vault_pass)
-            extra_vars = parse_extra_vars(options.extra_vars, vault_pass=vault_pass)
-            only_tags = options.tags.split(",")
-            skip_tags = options.skip_tags
-            if options.skip_tags is not None:
-                skip_tags = options.skip_tags.split(",")
-
-            for playbook in args:
-                if not os.path.exists(playbook):
-                    raise errors.AnsibleError("the playbook: %s could not be found" % playbook)
-
-            # run all playbooks specified on the command line
-            for playbook in args:
-                playbook = os.path.abspath(playbook)
-
-                # let inventory know which playbooks are using so it can know the basedirs
-                inventory.set_playbook_basedir(os.path.dirname(playbook))
-
-                stats = callbacks.AggregateStats()
-                playbook_cb = callbacks.PlaybookCallbacks(verbose=utils.VERBOSITY)
-                if options.step:
-                    playbook_cb.step = options.step
-                if options.start_at:
-                    playbook_cb.start_at = options.start_at
-                runner_cb = callbacks.PlaybookRunnerCallbacks(stats, verbose=utils.VERBOSITY)
-
-                kw = {}
-                if hasattr(options, 'become_ask_pass'):
-                    kw['become'] = options.become
-                    kw['become_method'] = options.become_method
-                    kw['become_pass'] = becomepass
-                    kw['become_user'] = options.become_user
-                else:
-                    if hasattr(options, 'su'):
-                        kw['su'] = options.su
-                        kw['su_user'] = options.su_user
-                    if hasattr(options, 'su_pass'):
-                        kw['su_pass'] = options.su_pass
-                    kw['sudo'] = options.sudo
-                    kw['sudo_user'] = options.sudo_user
-                    kw['sudo_pass'] = sudopass
-                if vault_pass:
-                    kw['vault_password'] = vault_pass
-                if hasattr(options, 'force_handlers'):
-                    kw['force_handlers'] = options.force_handlers
-                pb = ansible.playbook.PlayBook(
-                    playbook=playbook,
-                    module_path=options.module_path,
-                    inventory=inventory,
-                    forks=options.forks,
-                    remote_user=options.remote_user,
-                    callbacks=playbook_cb,
-                    runner_callbacks=runner_cb,
-                    stats=stats,
-                    timeout=options.timeout,
-                    transport=options.connection,
-                    extra_vars=extra_vars,
-                    private_key_file=options.private_key_file,
-                    only_tags=only_tags,
-                    skip_tags=skip_tags,
-                    check=options.check,
-                    diff=options.diff,
-                    **kw)
-
-                if options.listhosts or options.listtasks or options.syntax:
-                    print ''
-                    print 'playbook: %s' % playbook
-                    print ''
-                    playnum = 0
-                    for (play_ds, play_basedir) in zip(pb.playbook, pb.play_basedirs):
-                        playnum += 1
-                        play = ansible.playbook.Play(pb, play_ds, play_basedir)
-                        label = play.name
-                        hosts = pb.inventory.list_hosts(play.hosts)
-                        # Filter all tasks by given tags
-                        if pb.only_tags != 'all':
-                            if options.subset and not hosts:
-                                continue
-                            matched_tags, unmatched_tags = play.compare_tags(pb.only_tags)
-
-                            # Remove skipped tasks
-                            matched_tags = matched_tags - set(pb.skip_tags)
-
-                            unmatched_tags.discard('all')
-                            unknown_tags = ((set(pb.only_tags) | set(pb.skip_tags)) -
-                                            (matched_tags | unmatched_tags))
-
-                            if unknown_tags:
-                                continue
-
-                        if options.listhosts:
-                            print '  play #%d (%s): host count=%d' % (playnum, label, len(hosts))
-                            for host in hosts:
-                                print '    %s' % host
-
-                        if options.listtasks:
-                            print '  play #%d (%s):' % (playnum, label)
-
-                            for task in play.tasks():
-                                _only_tags = set(task.tags).intersection(pb.only_tags)
-                                _skip_tags = set(task.tags).intersection(pb.skip_tags)
-                                if (_only_tags and not _skip_tags):
-                                    if getattr(task, 'name', None) is not None:
-                                        # meta tasks have no names
-                                        print '    %s' % task.name
-                        print ''
-                    continue
-
-                if options.syntax:
-                    # if we've not exited by now then we are fine.
-                    print 'Playbook Syntax is fine'
-                    sys.exit(0)
-
-                failed_hosts = []
-                unreachable_hosts = []
-                pb.run()
-
-                hosts = sorted(pb.stats.processed.keys())
-                callbacks.display(callbacks.banner("PLAY RECAP"))
-                playbook_cb.on_stats(pb.stats)
-
-                for h in hosts:
-                    t = pb.stats.summarize(h)
-                    if t['failures'] > 0:
-                        failed_hosts.append(h)
-                    if t['unreachable'] > 0:
-                        unreachable_hosts.append(h)
-
-                retries = failed_hosts + unreachable_hosts
-
-                if len(retries) > 0:
-                    filename = pb.generate_retry_inventory(retries)
-                    if filename:
-                        callbacks.display("           to retry, use: --limit @%s\n" % filename)
-
-                for h in hosts:
-                    t = pb.stats.summarize(h)
-
-                    callbacks.display("%s : %s %s %s %s" % (
-                        hostcolor(h, t),
-                        colorize('ok', t['ok'], 'green'),
-                        colorize('changed', t['changed'], 'yellow'),
-                        colorize('unreachable', t['unreachable'], 'red'),
-                        colorize('failed', t['failures'], 'red')),
-                        screen_only=True
-                    )
-
-                    callbacks.display("%s : %s %s %s %s" % (
-                        hostcolor(h, t, False),
-                        colorize('ok', t['ok'], None),
-                        colorize('changed', t['changed'], None),
-                        colorize('unreachable', t['unreachable'], None),
-                        colorize('failed', t['failures'], None)),
-                        log_only=True
-                    )
-
-                print ""
-                if len(failed_hosts) > 0:
-                    sys.exit(2)
-                if len(unreachable_hosts) > 0:
-                    sys.exit(3)
-        except errors.AnsibleError as e:
-            callbacks.display("ERROR: %s" % e, color='red', stderr=True)
-            sys.exit(1)
+        return run_cli(self.ctrl, 'playbook', 'playbook', argv)
 
 
 class AnsibleConfigureCmd(object):
@@ -683,13 +242,17 @@ class AnsibleConfigureCmd(object):
         skip_tags = args.skip_tags
         if skip_tags is not None:
             skip_tags = skip_tags.split(",")
-        extra_vars = parse_extra_vars(args.extra_vars)
+        else:
+            skip_tags = []
+        inject_ansible_paths()
+        display.verbosity = args.verbose
+        options = AnsibleOptions()
+        options.verbosity = args.verbose
+        options.only_tags = only_tags
+        options.skip_tags = skip_tags
+        options.extra_vars = args.extra_vars
         instance.hooks.before_ansible_configure(instance)
-        instance.configure(
-            only_tags=only_tags,
-            skip_tags=skip_tags,
-            extra_vars=extra_vars,
-            verbosity=args.verbose)
+        instance.configure(options=options)
         instance.hooks.after_ansible_configure(instance)
 
 
@@ -704,7 +267,7 @@ class AnsibleInventoryCmd(object):
             prog="%s inventory" % self.ctrl.progname,
             description=help)
         parser.parse_args(argv)
-        inventory = _get_ansible_inventory(self.ctrl, self.ctrl.config)
+        inventory = _get_ansible_inventorymanager(self.ctrl, self.ctrl.config)
         groups = sorted(inventory.groups, key=attrgetter('name'))
         for group in groups:
             print group.name
@@ -848,15 +411,15 @@ class AnsibleVaultCmd(object):
 
     @lazy
     def AnsibleError(self):
-        inject_ansible_paths()
+        inject_ansible_paths(self.ctrl)
         from ansible.errors import AnsibleError
         return AnsibleError
 
     @lazy
     def ve(self):
-        inject_ansible_paths()
+        inject_ansible_paths(self.ctrl)
         try:
-            from ansible.utils.vault import VaultEditor
+            from ansible.parsing.vault import VaultEditor
         except ImportError:
             log.error("Your ansible installation doesn't support vaults.")
             sys.exit(1)
@@ -864,9 +427,9 @@ class AnsibleVaultCmd(object):
 
     @lazy
     def vl(self):
-        inject_ansible_paths()
+        inject_ansible_paths(self.ctrl)
         try:
-            from ansible.utils.vault import VaultLib
+            from ansible.parsing.vault import VaultLib
         except ImportError:
             log.error("Your ansible installation doesn't support vaults.")
             sys.exit(1)
@@ -934,30 +497,6 @@ class AnsibleVaultCmd(object):
             log.info("Rekeyed %s" % f)
 
 
-def connect_patch_factory(ctrl):
-    def connect_patch(self, *args, **kwargs):
-        self.runner._ploy_ctrl = ctrl
-        return self._ploy_orig_connect(*args, **kwargs)
-    return connect_patch
-
-
-def patch_connect(ctrl):
-    import pkg_resources
-    from ansible.utils import plugins
-    path = os.path.dirname(
-        pkg_resources.resource_filename(
-            'ploy_ansible',
-            'execnet_connection.py'))
-    plugins.connection_loader.add_directory(path)
-    try:
-        from ansible.runner.connection import Connector
-    except ImportError:
-        from ansible.runner.connection import Connection as Connector
-    if not hasattr(Connector, '_ploy_orig_connect'):
-        Connector._ploy_orig_connect = Connector.connect
-        Connector.connect = connect_patch_factory(ctrl)
-
-
 def has_playbook(self):
     playbooks_directory = get_playbooks_directory(self.master.main_config)
     playbook_path = os.path.join(playbooks_directory, '%s.yml' % self.uid)
@@ -970,48 +509,14 @@ def has_playbook(self):
     return False
 
 
-def get_playbook(self, *args, **kwargs):
-    inject_ansible_paths()
-    import ansible.playbook
-    import ansible.callbacks
+def get_plays(self, loader, inventory, variable_manager, *args, **kwargs):
+    inject_ansible_paths(self.master.ctrl)
+    from ansible.playbook import Play, Playbook
     import ansible.errors
-    import ansible.utils
-    try:
-        from ansible.utils.vault import VaultLib
-    except ImportError:
-        VaultLib = None
-    from ploy_ansible.inventory import Inventory
 
     host = self.uid
-    user = self.config.get('user', 'root')
-    sudo = self.config.get('sudo')
     playbooks_directory = get_playbooks_directory(self.master.main_config)
-
-    class PlayBook(ansible.playbook.PlayBook):
-        def __init__(self, *args, **kwargs):
-            self.roles = kwargs.pop('roles', None)
-            if self.roles is not None:
-                if isinstance(self.roles, basestring):
-                    self.roles = self.roles.split()
-                kwargs['playbook'] = '<dynamically generated from %s>' % self.roles
-            ansible.playbook.PlayBook.__init__(self, *args, **kwargs)
-            self.basedir = playbooks_directory
-
-        def _load_playbook_from_file(self, *args, **kwargs):
-            if self.roles is None:
-                return ansible.playbook.PlayBook._load_playbook_from_file(
-                    self, *args, **kwargs)
-            settings = {
-                'hosts': [host],
-                'user': user,
-                'roles': self.roles}
-            if sudo is not None:
-                settings['sudo'] = sudo
-            return (
-                [settings],
-                [playbooks_directory])
-
-    patch_connect(self.master.ctrl)
+    loader.set_basedir(playbooks_directory)
     playbook = kwargs.pop('playbook', None)
     if playbook is None:
         playbook_path = os.path.join(playbooks_directory, '%s.yml' % self.uid)
@@ -1029,62 +534,83 @@ def get_playbook(self, *args, **kwargs):
     if roles is not None and playbook is not None:
         log.error("You can't use a playbook and the 'roles' options at the same time for instance '%s'." % self.config_id)
         sys.exit(1)
-    stats = ansible.callbacks.AggregateStats()
-    callbacks = ansible.callbacks.PlaybookCallbacks(verbose=ansible.utils.VERBOSITY)
-    runner_callbacks = ansible.callbacks.PlaybookRunnerCallbacks(stats, verbose=ansible.utils.VERBOSITY)
     skip_host_check = kwargs.pop('skip_host_check', False)
-    if roles is None:
-        kwargs['playbook'] = playbook
-    else:
-        kwargs['roles'] = roles
-    if VaultLib is not None:
-        kwargs['vault_password'] = get_vault_password_source(self.master.main_config).get()
-    inventory = Inventory(self.master.ctrl, vault_password=kwargs.get('vault_password'))
     try:
-        pb = PlayBook(
-            *args,
-            callbacks=callbacks,
-            inventory=inventory,
-            runner_callbacks=runner_callbacks,
-            stats=stats,
-            **kwargs)
+        if roles is None:
+            pb = Playbook.load(playbook, variable_manager=variable_manager, loader=loader)
+            plays = pb.get_plays()
+        else:
+            if isinstance(roles, basestring):
+                roles = roles.split()
+            data = {
+                'hosts': [host],
+                'roles': roles}
+            plays = [Play.load(data, variable_manager=variable_manager, loader=loader)]
     except ansible.errors.AnsibleError as e:
         log.error("AnsibleError: %s" % e)
         sys.exit(1)
-    for (play_ds, play_basedir) in zip(pb.playbook, pb.play_basedirs):
-        if 'user' not in play_ds:
-            play_ds['user'] = self.config.get('user', 'root')
+    for play in plays:
+        if play._attributes.get('remote_user') is None:
+            play._attributes['remote_user'] = self.config.get('user', 'root')
+        if self.config.get('sudo'):
+            play._attributes['sudo'] = self.config.get('sudo')
         if not skip_host_check:
-            hosts = play_ds.get('hosts', '')
+            hosts = play._attributes.get('hosts', None)
             if isinstance(hosts, basestring):
                 hosts = hosts.split(':')
+            if hosts is None:
+                hosts = {}
             if self.uid not in hosts:
                 log.warning("The host '%s' is not in the list of hosts (%s) of '%s'.", self.uid, ','.join(hosts), playbook)
                 if not yesno("Do you really want to apply '%s' to the host '%s'?" % (playbook, self.uid)):
                     sys.exit(1)
-        play_ds['hosts'] = [self.uid]
-    return pb
+        play._attributes['hosts'] = [self.uid]
+    return plays
 
 
-def apply_playbook(self, playbook, *args, **kwargs):
-    self.get_playbook(playbook=playbook, *args, **kwargs).run()
+class AnsibleOptions(object):
+    def __init__(self):
+        from ansible import constants as C
+        self.ask_vault_pass = None
+        self.become = C.DEFAULT_BECOME
+        self.become_method = C.DEFAULT_BECOME_METHOD
+        self.become_user = C.DEFAULT_BECOME_USER
+        self.check = False
+        self.connection = C.DEFAULT_TRANSPORT
+        self.diff = C.DIFF_ALWAYS
+        self.forks = C.DEFAULT_FORKS
+        self.inventory = None
+        self.module_path = None
+        self.vault_ids = []
+        self.vault_password_files = None
+        self.verbosity = C.DEFAULT_VERBOSITY
 
 
 def configure(self, *args, **kwargs):
-    verbosity = kwargs.pop('verbosity', 0)
-    pb = self.get_playbook(*args, **kwargs)
-    # we have to wait importing ansible until after get_playbook ran, so the import order is correct
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.executor.task_queue_manager import TaskQueueManager
+    from ansible.utils.vars import load_extra_vars
+    from ansible.vars.manager import VariableManager
+    if 'options' in kwargs:
+        options = kwargs['options']
+    else:
+        options = AnsibleOptions()
+    if 'loader' in kwargs:
+        loader = kwargs['loader']
+    else:
+        loader = DataLoader()
+    inventory = self.get_ansible_inventorymanager()
+    variable_manager = VariableManager(loader=loader, inventory=inventory)
+    variable_manager.extra_vars = load_extra_vars(loader=loader, options=options)
+    tqm = TaskQueueManager(inventory=inventory, variable_manager=variable_manager, loader=loader, options=options, passwords=None)
+    plays = self.get_plays(inventory=inventory, variable_manager=variable_manager, loader=loader, *args, **kwargs)
     import ansible.errors
-    import ansible.utils
-    VERBOSITY = ansible.utils.VERBOSITY
-    ansible.utils.VERBOSITY = verbosity
     try:
-        pb.run()
+        for play in plays:
+            tqm.run(play=play)
     except ansible.errors.AnsibleError as e:
         log.error("AnsibleError: %s" % e)
         sys.exit(1)
-    finally:
-        ansible.utils.VERBOSITY = VERBOSITY
 
 
 class AnsibleVariablesDict(dict):
@@ -1093,19 +619,19 @@ class AnsibleVariablesDict(dict):
         return template(self.basedir, dict.__getitem__(self, name), self, fail_on_undefined=True)
 
 
-def _get_ansible_inventory(ctrl, main_config):
-    inject_ansible_paths()
-    from ploy_ansible.inventory import Inventory
+def _get_ansible_inventorymanager(ctrl, main_config):
+    inject_ansible_paths(ctrl)
+    from ploy_ansible.inventory import InventoryManager
     vault_password = get_vault_password_source(main_config).get(fail_on_error=False)
-    return Inventory(ctrl, vault_password=vault_password)
+    return InventoryManager()
 
 
-def get_ansible_inventory(self):
-    return _get_ansible_inventory(self.master.ctrl, self.master.main_config)
+def get_ansible_inventorymanager(self):
+    return _get_ansible_inventorymanager(self.master.ctrl, self.master.main_config)
 
 
 def get_ansible_variables(self):
-    inventory = self.get_ansible_inventory()
+    inventory = self.get_ansible_inventorymanager()
     basedir = get_playbooks_directory(self.master.ctrl.config)
     result = AnsibleVariablesDict(inventory.get_variables(self.uid))
     result.basedir = basedir
@@ -1114,23 +640,21 @@ def get_ansible_variables(self):
 
 def get_vault_lib(self):
     try:
-        from ansible.utils.vault import VaultLib
+        from ansible.parsing.vault import VaultLib
     except ImportError:
         return None
     return VaultLib(get_vault_password_source(self.master.main_config).get())
 
 
 def augment_instance(instance):
-    if not hasattr(instance, 'apply_playbook'):
-        instance.apply_playbook = apply_playbook.__get__(instance, instance.__class__)
     if not hasattr(instance, 'has_playbook'):
         instance.has_playbook = has_playbook.__get__(instance, instance.__class__)
-    if not hasattr(instance, 'get_playbook'):
-        instance.get_playbook = get_playbook.__get__(instance, instance.__class__)
+    if not hasattr(instance, 'get_plays'):
+        instance.get_plays = get_plays.__get__(instance, instance.__class__)
     if not hasattr(instance, 'configure'):
         instance.configure = configure.__get__(instance, instance.__class__)
-    if not hasattr(instance, 'get_ansible_inventory'):
-        instance.get_ansible_inventory = get_ansible_inventory.__get__(instance, instance.__class__)
+    if not hasattr(instance, 'get_ansible_inventorymanager'):
+        instance.get_ansible_inventorymanager = get_ansible_inventorymanager.__get__(instance, instance.__class__)
     if not hasattr(instance, 'get_ansible_variables'):
         instance.get_ansible_variables = get_ansible_variables.__get__(instance, instance.__class__)
     if not hasattr(instance, 'get_vault_lib'):
